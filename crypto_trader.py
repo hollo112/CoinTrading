@@ -5,7 +5,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import json
 import os
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 
 from trading.strategy import TradingStrategy
 from trading.data_collector import (
@@ -74,6 +75,58 @@ def cached_kimchi_premium(upbit_ticker, binance_symbol):
 @st.cache_data(ttl=15)
 def cached_orderbook(ticker):
     return get_orderbook_analysis(ticker)
+
+@st.cache_data(ttl=300, show_spinner="코인 스캔 중...")
+def scan_coins():
+    """주요 코인 전체 스캔 → 시그널 점수 순위"""
+    popular = [
+        "KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL", "KRW-DOGE",
+        "KRW-ADA", "KRW-AVAX", "KRW-DOT", "KRW-LINK", "KRW-MATIC",
+        "KRW-ATOM", "KRW-TRX", "KRW-ETC", "KRW-BCH", "KRW-NEAR",
+        "KRW-APT", "KRW-ARB", "KRW-OP", "KRW-SUI", "KRW-SEI",
+        "KRW-AAVE", "KRW-IMX", "KRW-STX", "KRW-SAND", "KRW-MANA",
+    ]
+    try:
+        available = pyupbit.get_tickers(fiat="KRW")
+    except Exception:
+        available = []
+    tickers = [t for t in popular if t in available]
+
+    strategy = TradingStrategy()
+    results = []
+
+    for ticker in tickers:
+        try:
+            df = pyupbit.get_ohlcv(ticker, interval="minute60", count=100)
+            if df is None or len(df) < 50:
+                continue
+            signal = strategy.get_signal(df)
+            price = df.iloc[-1]["close"]
+            change = 0.0
+            if len(df) >= 24:
+                change = (df.iloc[-1]["close"] - df.iloc[-24]["close"]) / df.iloc[-24]["close"] * 100
+            vol_krw = df.iloc[-1]["close"] * df.iloc[-1]["volume"]
+
+            buy_signals = [k for k, v in signal["signals"].items() if v[0] == "매수"]
+            sell_signals = [k for k, v in signal["signals"].items() if v[0] == "매도"]
+
+            results.append({
+                "코인": ticker.replace("KRW-", ""),
+                "ticker": ticker,
+                "현재가": price,
+                "24h변동": change,
+                "스코어": signal["score"],
+                "판단": signal["action"],
+                "매수시그널": ", ".join(buy_signals) if buy_signals else "-",
+                "매도시그널": ", ".join(sell_signals) if sell_signals else "-",
+                "거래대금": vol_krw,
+            })
+            time.sleep(0.11)  # API 속도 제한 준수
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: x["스코어"], reverse=True)
+    return results
 
 # ================================================================
 #  헬퍼 함수
@@ -279,15 +332,36 @@ with st.sidebar:
 
     st.divider()
 
+    # ── 매매 모드 선택 ──
+    st.subheader("매매 모드")
+    trade_mode = st.radio("매매 모드", ["단일 코인", "멀티코인"],
+                          horizontal=True, key="trade_mode")
+
     # ── 코인 / 차트 설정 ──
     st.subheader("코인 / 차트 설정")
     tickers = cached_get_tickers()
     ticker_names = {t: t.replace("KRW-", "") for t in tickers}
-    default_idx = tickers.index("KRW-BTC") if "KRW-BTC" in tickers else 0
-    selected_ticker = st.selectbox(
-        "코인 선택", tickers,
-        format_func=lambda x: ticker_names.get(x, x), index=default_idx,
-    )
+
+    if trade_mode == "단일 코인":
+        coin_search = st.text_input("코인 검색", placeholder="BTC, ETH, XRP...", key="coin_search")
+        if coin_search:
+            filtered = [t for t in tickers if coin_search.upper() in t.upper()]
+        else:
+            filtered = tickers
+
+        if not filtered:
+            st.warning(f"'{coin_search}' 검색 결과가 없습니다.")
+            filtered = tickers
+
+        default_idx = filtered.index("KRW-BTC") if "KRW-BTC" in filtered else 0
+        selected_ticker = st.selectbox(
+            "코인 선택", filtered,
+            format_func=lambda x: ticker_names.get(x, x), index=default_idx,
+        )
+    else:
+        st.info("멀티코인 모드: 25개 주요 코인을 자동 스캔합니다.")
+        max_coins = st.slider("동시 보유 최대 코인 수", 1, 10, 5, key="max_coins")
+        selected_ticker = "KRW-BTC"  # 차트 표시용 기본값
 
     interval_options = {
         "1분": "minute1", "3분": "minute3", "5분": "minute5",
@@ -339,16 +413,27 @@ with st.sidebar:
         # 자동매매 시작 / 중지
         if not st.session_state.auto_trading:
             if st.button("자동매매 시작", type="primary", use_container_width=True):
-                st.session_state.trader.start(
-                    ticker=selected_ticker, interval=selected_interval,
-                    check_interval=check_interval, invest_ratio=invest_ratio,
-                    max_invest_amount=max_invest,
-                    strategy_params=strategy_params,
-                )
+                if trade_mode == "멀티코인":
+                    st.session_state.trader.start_multi(
+                        interval=selected_interval,
+                        check_interval=check_interval,
+                        invest_ratio=invest_ratio,
+                        max_invest_amount=max_invest,
+                        max_coins=max_coins,
+                        strategy_params=strategy_params,
+                    )
+                else:
+                    st.session_state.trader.start(
+                        ticker=selected_ticker, interval=selected_interval,
+                        check_interval=check_interval, invest_ratio=invest_ratio,
+                        max_invest_amount=max_invest,
+                        strategy_params=strategy_params,
+                    )
                 st.session_state.auto_trading = True
                 st.rerun()
         else:
-            st.warning(f"자동매매 실행 중 ({st.session_state.trader.ticker})")
+            mode_label = "멀티코인" if st.session_state.trader.multi_mode else st.session_state.trader.ticker
+            st.warning(f"자동매매 실행 중 ({mode_label})")
             if st.button("자동매매 중지", use_container_width=True):
                 st.session_state.trader.stop()
                 st.session_state.auto_trading = False
@@ -364,7 +449,7 @@ with st.sidebar:
 # ================================================================
 st.title("코인 자동매매 대시보드")
 
-tab1, tab2, tab3, tab4 = st.tabs(["대시보드", "차트 분석", "거래 내역", "시장 현황"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["대시보드", "차트 분석", "거래 내역", "시장 현황", "코인 스캐너"])
 
 # ──────────────────────────────────────────────
 #  탭 1 : 대시보드
@@ -466,10 +551,82 @@ with tab1:
         if st.session_state.auto_trading:
             st.divider()
             st.subheader("봇 상태")
-            bc1, bc2, bc3 = st.columns(3)
+            bc1, bc2, bc3, bc4 = st.columns(4)
             bc1.metric("상태", trader.status)
             bc2.metric("마지막 확인", trader.last_check_time or "-")
-            bc3.metric("총 거래 횟수", f"{len(trader.get_trade_log())}건")
+            bc3.metric("체크 횟수", f"{trader.check_count}회")
+            bc4.metric("총 거래", f"{len(trader.get_trade_log())}건")
+
+            # 봇의 실제 판단 표시
+            if trader.last_reason:
+                st.info(f"봇 판단: {trader.last_reason}")
+
+            # ── 멀티코인 모드 상태 표시 ──
+            if trader.multi_mode and trader.multi_status:
+                st.subheader("멀티코인 스캔 결과")
+
+                # 보유 코인 수익률
+                held = trader.get_held_coins()
+                if held:
+                    st.markdown("**보유 코인**")
+                    held_rows = []
+                    for t, info in held.items():
+                        try:
+                            cur_p = pyupbit.get_current_price(t)
+                            pnl = ((cur_p - info["avg_price"]) / info["avg_price"] * 100) if cur_p and info["avg_price"] > 0 else 0
+                            eval_amt = info["amount"] * cur_p if cur_p else 0
+                        except Exception:
+                            pnl = 0
+                            eval_amt = 0
+                        status_info = trader.multi_status.get(t, {})
+                        held_rows.append({
+                            "코인": t.replace("KRW-", ""),
+                            "수익률": f"{pnl:+.2f}%",
+                            "평가금액": f"{eval_amt:,.0f}원",
+                            "스코어": status_info.get("score", "-"),
+                            "상태": status_info.get("reason", "-"),
+                        })
+                    st.dataframe(pd.DataFrame(held_rows), use_container_width=True, hide_index=True)
+
+                # 전체 스캔 결과 테이블
+                with st.expander("전체 스캔 결과 (클릭하여 펼치기)"):
+                    scan_rows = []
+                    for t, s in trader.multi_status.items():
+                        action_display = {
+                            "BUY": "매수", "SELL": "매도", "HOLD": "관망",
+                            "BUY 후보": "매수 후보", "보유중": "보유중",
+                            "SKIP": "건너뜀", "ERROR": "에러",
+                        }.get(s["action"], s["action"])
+                        scan_rows.append({
+                            "코인": t.replace("KRW-", ""),
+                            "판단": action_display,
+                            "스코어": f"{s['score']:+d}" if isinstance(s["score"], int) else str(s["score"]),
+                            "사유": s["reason"],
+                        })
+                    # 스코어 순 정렬
+                    scan_rows.sort(key=lambda x: int(x["스코어"]) if x["스코어"].lstrip("+-").isdigit() else 0, reverse=True)
+                    st.dataframe(pd.DataFrame(scan_rows), use_container_width=True, hide_index=True)
+
+            # ── 단일 코인 모드 시그널 상세 ──
+            elif not trader.multi_mode and trader.last_signal:
+                bot_sig = trader.last_signal
+                bot_tag_map = {"BUY": ("매수", "buy-tag"), "SELL": ("매도", "sell-tag"), "HOLD": ("관망", "hold-tag")}
+                bot_txt, bot_css = bot_tag_map.get(bot_sig["action"], ("관망", "hold-tag"))
+                bot_buy_th = bot_sig.get("buy_threshold", 3)
+                bot_sell_th = bot_sig.get("sell_threshold", -3)
+                st.markdown(
+                    f'봇 시그널: <span class="{bot_css}">{bot_txt}</span> '
+                    f'(스코어: {bot_sig["score"]:+d} / 매수 {bot_buy_th}+ 매도 {bot_sell_th}-)',
+                    unsafe_allow_html=True,
+                )
+                # 봇의 개별 시그널 중 매수/매도만 표시
+                active_sigs = {k: v for k, v in bot_sig["signals"].items() if v[0] != "중립"}
+                if active_sigs:
+                    cols = st.columns(min(len(active_sigs), 4))
+                    for i, (name, (direction, detail)) in enumerate(active_sigs.items()):
+                        with cols[i % len(cols)]:
+                            color = "red" if direction == "매수" else "blue"
+                            st.markdown(f"**{name}**: :{color}[{direction}] {detail}")
     else:
         st.info("사이드바에서 업비트 API 키를 입력하고 연결하세요.")
         st.markdown("""
@@ -683,6 +840,78 @@ with tab4:
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.warning("코인 데이터를 불러올 수 없습니다.")
+
+# ──────────────────────────────────────────────
+#  탭 5 : 코인 스캐너
+# ──────────────────────────────────────────────
+with tab5:
+    st.subheader("코인 스캐너 - 유망 코인 자동 탐색")
+    st.caption("주요 25개 코인의 기술적 지표를 분석하여 매수/매도 시그널 점수로 순위를 매깁니다.")
+
+    if st.button("스캔 시작", type="primary", key="scan_btn"):
+        st.cache_data.clear()
+
+    scan_results = scan_coins()
+
+    if scan_results:
+        # 상위 매수 추천 / 하위 매도 경고
+        buy_candidates = [r for r in scan_results if r["스코어"] >= 2]
+        sell_warnings = [r for r in scan_results if r["스코어"] <= -2]
+
+        if buy_candidates:
+            st.success(f"매수 유망 코인: {', '.join(r['코인'] for r in buy_candidates[:5])}")
+        if sell_warnings:
+            st.error(f"매도 경고 코인: {', '.join(r['코인'] for r in sell_warnings[:5])}")
+        if not buy_candidates and not sell_warnings:
+            st.info("현재 강한 시그널을 보이는 코인이 없습니다. (관망장)")
+
+        # 전체 결과 테이블
+        display_rows = []
+        for i, r in enumerate(scan_results):
+            action_kr = {"BUY": "매수", "SELL": "매도", "HOLD": "관망"}.get(r["판단"], "관망")
+            display_rows.append({
+                "순위": i + 1,
+                "코인": r["코인"],
+                "현재가": f"{r['현재가']:,.0f}원",
+                "24h": f"{r['24h변동']:+.1f}%",
+                "스코어": f"{r['스코어']:+d}",
+                "판단": action_kr,
+                "매수 시그널": r["매수시그널"],
+                "매도 시그널": r["매도시그널"],
+                "거래대금": f"{format_krw(r['거래대금'])}원",
+            })
+
+        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.caption(
+            "스코어 = 각 지표(RSI, MACD, 볼린저밴드, 이동평균, 거래량, ADX, StochRSI, "
+            "OBV, 일목균형표, 변동성돌파)의 매수(+1)/매도(-1) 합산. "
+            "높을수록 매수 시그널이 강합니다."
+        )
+    else:
+        st.warning("코인 스캔 데이터를 불러올 수 없습니다.")
+
+# ================================================================
+#  매매 시 자동 새로고침
+# ================================================================
+@st.fragment(run_every=timedelta(seconds=5))
+def trade_watcher():
+    """매매 발생 시 자동으로 페이지 새로고침"""
+    if not st.session_state.get("auto_trading"):
+        return
+    log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_history.json")
+    try:
+        mtime = os.path.getmtime(log_file) if os.path.exists(log_file) else 0
+    except Exception:
+        mtime = 0
+    if "last_log_mtime" not in st.session_state:
+        st.session_state.last_log_mtime = mtime
+    elif mtime > st.session_state.last_log_mtime:
+        st.session_state.last_log_mtime = mtime
+        st.rerun()
+
+trade_watcher()
 
 # ================================================================
 #  푸터
