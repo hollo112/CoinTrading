@@ -25,6 +25,21 @@ st.markdown("""
     .buy-tag  {background:#ff4444;color:#fff;padding:4px 12px;border-radius:6px;font-weight:700}
     .sell-tag {background:#4444ff;color:#fff;padding:4px 12px;border-radius:6px;font-weight:700}
     .hold-tag {background:#888;color:#fff;padding:4px 12px;border-radius:6px;font-weight:700}
+    .profit {color:#00c853 !important;font-weight:700}
+    .loss {color:#ff1744 !important;font-weight:700}
+    .neutral-val {color:#9e9e9e}
+    .badge {display:inline-block;padding:3px 10px;border-radius:4px;font-weight:700;font-size:0.85em}
+    .badge-buy {background:#00c853;color:#fff}
+    .badge-sell {background:#ff1744;color:#fff}
+    .badge-hold {background:#78909c;color:#fff}
+    .badge-stoploss {background:#d50000;color:#fff}
+    .badge-takeprofit {background:#00bfa5;color:#fff}
+    .badge-trailing {background:#ff6d00;color:#fff}
+    .badge-error {background:#ff9800;color:#fff}
+    .coin-table {width:100%;border-collapse:collapse;margin:10px 0}
+    .coin-table th {text-align:left;padding:8px 12px;border-bottom:2px solid rgba(255,255,255,0.2);font-size:0.9em;color:#aaa}
+    .coin-table td {padding:8px 12px;border-bottom:1px solid rgba(255,255,255,0.08);font-size:0.9em}
+    .budget-info {background:rgba(255,255,255,0.05);border-radius:10px;padding:15px;margin:10px 0}
 </style>
 """, unsafe_allow_html=True)
 
@@ -139,6 +154,31 @@ def format_krw(value):
     if value >= 1_0000:
         return f"{value / 1_0000:,.0f}만"
     return f"{value:,.0f}"
+
+
+def colored_pnl(value_str):
+    """수익률/수익금 문자열에 초록(+)/빨강(-) 색상 적용"""
+    try:
+        num = float(str(value_str).replace('%', '').replace('원', '').replace(',', '').replace('+', ''))
+    except (ValueError, TypeError):
+        return str(value_str)
+    if num > 0:
+        return f'<span class="profit">{value_str}</span>'
+    elif num < 0:
+        return f'<span class="loss">{value_str}</span>'
+    return f'<span class="neutral-val">{value_str}</span>'
+
+
+def type_badge(trade_type):
+    """거래 유형에 색상 배지 적용"""
+    badge_map = {
+        "매수": "badge-buy", "매도": "badge-sell",
+        "손절": "badge-stoploss", "익절": "badge-takeprofit",
+        "트레일링": "badge-trailing", "매수실패": "badge-error",
+        "매도실패": "badge-error", "ERROR": "badge-error",
+    }
+    css = badge_map.get(trade_type, "badge-hold")
+    return f'<span class="badge {css}">{trade_type}</span>'
 
 
 def create_chart(df, strategy):
@@ -306,15 +346,30 @@ with st.sidebar:
     with col_conn2:
         disconnect_btn = st.button("연결 해제", use_container_width=True)
 
-    if connect_btn and access_key and secret_key:
-        try:
-            trader = AutoTrader(access_key, secret_key)
-            trader.get_krw_balance()  # 연결 테스트
-            st.session_state.trader = trader
-            st.session_state.connected = True
-            st.success("연결 성공!")
-        except Exception as e:
-            st.error(f"연결 실패: {e}")
+    if connect_btn:
+        if not access_key or not secret_key:
+            st.error("Access Key / Secret Key를 모두 입력해주세요.")
+        else:
+            try:
+                trader = AutoTrader(access_key, secret_key)
+                # 예외를 삼키는 래퍼 대신 원본 응답으로 연결 유효성 검증
+                raw_balances = trader.upbit.get_balances()
+                if not isinstance(raw_balances, list):
+                    error_msg = "잔고 조회 응답이 비정상입니다."
+                    if isinstance(raw_balances, dict):
+                        error_msg = raw_balances.get("error", {}).get("message", error_msg)
+                    raise ValueError(error_msg)
+                if raw_balances and isinstance(raw_balances[0], dict) and "error" in raw_balances[0]:
+                    raise ValueError(raw_balances[0].get("error", {}).get("message", "API 인증 실패"))
+
+                st.session_state.trader = trader
+                st.session_state.connected = True
+                st.success("연결 성공!")
+            except Exception as e:
+                st.session_state.trader = None
+                st.session_state.connected = False
+                st.session_state.auto_trading = False
+                st.error(f"연결 실패: {e}")
 
     if disconnect_btn:
         if st.session_state.trader:
@@ -378,6 +433,10 @@ with st.sidebar:
 
         invest_ratio = st.slider("투자 비율 (%)", 1, 100, 10, 1) / 100
         max_invest = st.number_input("1회 최대 투자금 (원)", 5000, 10_000_000, 100_000, 10_000)
+        max_budget = st.number_input(
+            "총 운용자금 한도 (원)", 0, 1_000_000_000, 0, 100_000,
+            help="0 = 제한 없음. 계좌 잔고와 관계없이 이 금액 내에서만 매매합니다.",
+        )
         check_interval = st.number_input("확인 주기 (초)", 30, 3600, 60, 30)
 
         with st.expander("전략 파라미터 조정"):
@@ -421,6 +480,7 @@ with st.sidebar:
                         max_invest_amount=max_invest,
                         max_coins=max_coins,
                         strategy_params=strategy_params,
+                        max_total_budget=max_budget,
                     )
                 else:
                     st.session_state.trader.start(
@@ -428,6 +488,7 @@ with st.sidebar:
                         check_interval=check_interval, invest_ratio=invest_ratio,
                         max_invest_amount=max_invest,
                         strategy_params=strategy_params,
+                        max_total_budget=max_budget,
                     )
                 st.session_state.auto_trading = True
                 st.rerun()
@@ -503,12 +564,102 @@ with tab1:
         mc2.metric("코인 평가액", f"{total_coin_value:,.0f}원")
         mc3.metric("총 자산", f"{total_assets:,.0f}원")
 
+        # 운용자금 한도 표시
+        if trader.max_total_budget > 0:
+            budget = trader.max_total_budget
+            invested = trader._get_total_invested()
+            available = trader.get_available_krw()
+            usage_pct = min(invested / budget, 1.0) if budget > 0 else 0
+            bar_color = "#00c853" if usage_pct < 0.7 else "#ff9800" if usage_pct < 0.9 else "#ff1744"
+            st.markdown(
+                f'<div class="budget-info">'
+                f'<strong>운용자금 한도:</strong> {budget:,.0f}원 &nbsp;|&nbsp; '
+                f'<strong>투자 중:</strong> {colored_pnl(f"{invested:,.0f}원") if invested > 0 else "0원"} &nbsp;|&nbsp; '
+                f'<strong>추가 매수 가능:</strong> {available:,.0f}원'
+                f'<div class="budget-bar" style="margin-top:8px">'
+                f'<div class="budget-fill" style="background:{bar_color};width:{max(usage_pct * 100, 1):.0f}%">'
+                f'{usage_pct:.0%} 사용</div></div></div>',
+                unsafe_allow_html=True,
+            )
+
         st.divider()
 
         # 보유 코인
         if coin_holdings:
             st.subheader("보유 코인 현황")
-            st.dataframe(pd.DataFrame(coin_holdings), use_container_width=True, hide_index=True)
+            html = '<table class="coin-table"><tr>'
+            for header in ["코인", "보유량", "매수평균가", "현재가", "평가금액", "수익률", "수익금"]:
+                html += f'<th>{header}</th>'
+            html += '</tr>'
+            for h in coin_holdings:
+                html += (
+                    f'<tr><td><strong>{h["코인"]}</strong></td>'
+                    f'<td>{h["보유량"]}</td>'
+                    f'<td>{h["매수평균가"]}</td>'
+                    f'<td>{h["현재가"]}</td>'
+                    f'<td>{h["평가금액"]}</td>'
+                    f'<td>{colored_pnl(h["수익률"])}</td>'
+                    f'<td>{colored_pnl(h["수익금"])}</td></tr>'
+                )
+            html += '</table>'
+            st.markdown(html, unsafe_allow_html=True)
+
+            st.markdown("**보유 코인 빠른 주문**")
+            allow_manual_fast_order = True
+            if st.session_state.auto_trading:
+                st.warning("자동매매 실행 중입니다. 빠른 주문은 봇 동작과 충돌할 수 있습니다.")
+                allow_manual_fast_order = st.checkbox(
+                    "자동매매 중에도 빠른 주문 허용",
+                    value=False,
+                    key="allow_manual_fast_order",
+                )
+
+            quick_buy_krw = st.number_input(
+                "추가 매수 금액 (원)",
+                min_value=5000,
+                max_value=1_000_000_000,
+                value=10000,
+                step=5000,
+                key="holding_quick_buy_krw",
+                disabled=not allow_manual_fast_order,
+            )
+            confirm_sell_all = st.checkbox(
+                "전량 매도 확인 (체크 시 '바로 매도' 버튼 활성화)",
+                value=False,
+                key="confirm_sell_all_holdings",
+                disabled=not allow_manual_fast_order,
+            )
+
+            for h in coin_holdings:
+                coin = h["코인"]
+                ticker = f"KRW-{coin}"
+                qc1, qc2, qc3 = st.columns([2, 1, 1])
+                with qc1:
+                    st.caption(f"{coin} | 보유량 {h['보유량']}개")
+                with qc2:
+                    if st.button(
+                        f"{coin} 추가 매수",
+                        use_container_width=True,
+                        key=f"holding_buy_{coin}",
+                        disabled=not allow_manual_fast_order,
+                    ):
+                        ok, msg = trader.manual_buy(ticker, quick_buy_krw)
+                        if ok:
+                            st.success(f"{coin} 추가 매수 완료")
+                            st.rerun()
+                        st.error(f"{coin} 매수 실패: {msg}")
+                with qc3:
+                    if st.button(
+                        f"{coin} 바로 매도",
+                        use_container_width=True,
+                        key=f"holding_sell_{coin}",
+                        disabled=(not allow_manual_fast_order) or (not confirm_sell_all),
+                    ):
+                        ok, msg = trader.manual_sell(ticker, 1.0)
+                        if ok:
+                            st.success(f"{coin} 전량 매도 완료")
+                            st.rerun()
+                        st.error(f"{coin} 매도 실패: {msg}")
         else:
             st.info("보유 중인 코인이 없습니다.")
 
@@ -551,25 +702,30 @@ with tab1:
         if st.session_state.auto_trading:
             st.divider()
             st.subheader("봇 상태")
+            state = trader.get_state_snapshot()
             bc1, bc2, bc3, bc4 = st.columns(4)
-            bc1.metric("상태", trader.status)
-            bc2.metric("마지막 확인", trader.last_check_time or "-")
-            bc3.metric("체크 횟수", f"{trader.check_count}회")
+            bc1.metric("상태", state.get("status") or "-")
+            bc2.metric("마지막 확인", state.get("last_check_time") or "-")
+            bc3.metric("체크 횟수", f"{state.get('check_count', 0)}회")
             bc4.metric("총 거래", f"{len(trader.get_trade_log())}건")
 
             # 봇의 실제 판단 표시
-            if trader.last_reason:
-                st.info(f"봇 판단: {trader.last_reason}")
+            if state.get("last_reason"):
+                st.info(f"봇 판단: {state.get('last_reason')}")
 
             # ── 멀티코인 모드 상태 표시 ──
-            if trader.multi_mode and trader.multi_status:
+            multi_status = state.get("multi_status") or {}
+            if state.get("multi_mode") and multi_status:
                 st.subheader("멀티코인 스캔 결과")
 
                 # 보유 코인 수익률
                 held = trader.get_held_coins()
                 if held:
                     st.markdown("**보유 코인**")
-                    held_rows = []
+                    html = '<table class="coin-table"><tr>'
+                    for header in ["코인", "수익률", "평가금액", "스코어", "상태"]:
+                        html += f'<th>{header}</th>'
+                    html += '</tr>'
                     for t, info in held.items():
                         try:
                             cur_p = pyupbit.get_current_price(t)
@@ -578,38 +734,51 @@ with tab1:
                         except Exception:
                             pnl = 0
                             eval_amt = 0
-                        status_info = trader.multi_status.get(t, {})
-                        held_rows.append({
-                            "코인": t.replace("KRW-", ""),
-                            "수익률": f"{pnl:+.2f}%",
-                            "평가금액": f"{eval_amt:,.0f}원",
-                            "스코어": status_info.get("score", "-"),
-                            "상태": status_info.get("reason", "-"),
-                        })
-                    st.dataframe(pd.DataFrame(held_rows), use_container_width=True, hide_index=True)
+                        status_info = multi_status.get(t, {})
+                        score = status_info.get("score", "-")
+                        score_colored = colored_pnl(f"{score:+d}") if isinstance(score, int) else str(score)
+                        html += (
+                            f'<tr><td><strong>{t.replace("KRW-", "")}</strong></td>'
+                            f'<td>{colored_pnl(f"{pnl:+.2f}%")}</td>'
+                            f'<td>{eval_amt:,.0f}원</td>'
+                            f'<td>{score_colored}</td>'
+                            f'<td>{status_info.get("reason", "-")}</td></tr>'
+                        )
+                    html += '</table>'
+                    st.markdown(html, unsafe_allow_html=True)
 
                 # 전체 스캔 결과 테이블
                 with st.expander("전체 스캔 결과 (클릭하여 펼치기)"):
                     scan_rows = []
-                    for t, s in trader.multi_status.items():
+                    for t, s in multi_status.items():
                         action_display = {
                             "BUY": "매수", "SELL": "매도", "HOLD": "관망",
                             "BUY 후보": "매수 후보", "보유중": "보유중",
                             "SKIP": "건너뜀", "ERROR": "에러",
                         }.get(s["action"], s["action"])
+                        score_val = s["score"]
                         scan_rows.append({
                             "코인": t.replace("KRW-", ""),
                             "판단": action_display,
-                            "스코어": f"{s['score']:+d}" if isinstance(s["score"], int) else str(s["score"]),
+                            "score_num": score_val if isinstance(score_val, int) else 0,
+                            "스코어": f"{score_val:+d}" if isinstance(score_val, int) else str(score_val),
                             "사유": s["reason"],
                         })
-                    # 스코어 순 정렬
-                    scan_rows.sort(key=lambda x: int(x["스코어"]) if x["스코어"].lstrip("+-").isdigit() else 0, reverse=True)
-                    st.dataframe(pd.DataFrame(scan_rows), use_container_width=True, hide_index=True)
+                    scan_rows.sort(key=lambda x: x["score_num"], reverse=True)
+                    html = '<table class="coin-table"><tr><th>코인</th><th>판단</th><th>스코어</th><th>사유</th></tr>'
+                    for r in scan_rows:
+                        html += (
+                            f'<tr><td><strong>{r["코인"]}</strong></td>'
+                            f'<td>{type_badge(r["판단"])}</td>'
+                            f'<td>{colored_pnl(r["스코어"])}</td>'
+                            f'<td>{r["사유"]}</td></tr>'
+                        )
+                    html += '</table>'
+                    st.markdown(html, unsafe_allow_html=True)
 
             # ── 단일 코인 모드 시그널 상세 ──
-            elif not trader.multi_mode and trader.last_signal:
-                bot_sig = trader.last_signal
+            elif not state.get("multi_mode") and state.get("last_signal"):
+                bot_sig = state.get("last_signal")
                 bot_tag_map = {"BUY": ("매수", "buy-tag"), "SELL": ("매도", "sell-tag"), "HOLD": ("관망", "hold-tag")}
                 bot_txt, bot_css = bot_tag_map.get(bot_sig["action"], ("관망", "hold-tag"))
                 bot_buy_th = bot_sig.get("buy_threshold", 3)
@@ -682,30 +851,59 @@ with tab3:
                 pass
 
     if trade_log:
-        filter_options = ["전체", "매수", "매도", "매수실패", "매도실패", "ERROR"]
+        filter_options = ["전체", "매수", "매도", "손절", "익절", "트레일링", "매수실패", "매도실패", "ERROR"]
         filter_type = st.selectbox("유형 필터", filter_options)
 
         filtered = trade_log if filter_type == "전체" else [t for t in trade_log if t.get("type") == filter_type]
 
         if filtered:
-            df_trades = pd.DataFrame(list(reversed(filtered)))
+            reversed_filtered = list(reversed(filtered))
+            html = '<table class="coin-table"><tr>'
+            for header in ["시간", "유형", "코인", "내용", "금액(원)", "가격", "시그널"]:
+                html += f'<th>{header}</th>'
+            html += '</tr>'
+            for t in reversed_filtered[:100]:  # 최근 100건
+                ticker_display = t.get("ticker", "").replace("KRW-", "")
+                amount_str = f'{t.get("amount", 0):,.0f}' if t.get("amount", 0) else "-"
+                price_str = f'{t.get("price", 0):,.0f}' if t.get("price", 0) else "-"
+                score = t.get("signal_score", 0)
+                score_str = colored_pnl(f"{score:+d}") if score else "-"
+                html += (
+                    f'<tr><td>{t.get("time", "")}</td>'
+                    f'<td>{type_badge(t.get("type", ""))}</td>'
+                    f'<td><strong>{ticker_display}</strong></td>'
+                    f'<td>{t.get("message", "")}</td>'
+                    f'<td>{amount_str}</td>'
+                    f'<td>{price_str}</td>'
+                    f'<td>{score_str}</td></tr>'
+                )
+            html += '</table>'
+            if len(reversed_filtered) > 100:
+                html += f'<p style="color:#aaa;font-size:0.85em">최근 100건만 표시 (전체 {len(reversed_filtered)}건)</p>'
+            st.markdown(html, unsafe_allow_html=True)
+
+            # CSV 다운로드는 전체 데이터
+            df_trades = pd.DataFrame(reversed_filtered)
             display_cols = ["time", "type", "ticker", "message", "amount", "price", "signal_score"]
             rename_map = {
                 "time": "시간", "type": "유형", "ticker": "코인",
                 "message": "내용", "amount": "금액(원)", "price": "가격",
                 "signal_score": "시그널",
             }
-            available = [c for c in display_cols if c in df_trades.columns]
-            df_display = df_trades[available].rename(columns=rename_map)
-            st.dataframe(df_display, use_container_width=True, hide_index=True)
-
+            available_cols = [c for c in display_cols if c in df_trades.columns]
+            df_display = df_trades[available_cols].rename(columns=rename_map)
             csv = df_display.to_csv(index=False).encode("utf-8-sig")
             st.download_button("CSV 다운로드", csv, "trade_history.csv", "text/csv")
         else:
             st.info("해당 유형의 거래 내역이 없습니다.")
 
         if st.session_state.connected:
-            if st.button("거래 내역 초기화"):
+            confirm_clear_log = st.checkbox(
+                "거래 내역 초기화 확인",
+                value=False,
+                key="confirm_clear_trade_log",
+            )
+            if st.button("거래 내역 초기화", disabled=not confirm_clear_log):
                 st.session_state.trader.clear_trade_log()
                 st.rerun()
     else:
@@ -827,17 +1025,22 @@ with tab4:
     st.subheader("시가총액 TOP 10")
     top_coins = cached_top_coins()
     if top_coins:
-        rows = []
+        html = '<table class="coin-table"><tr>'
+        for header in ["#", "코인", "현재가", "24h 변동", "시가총액", "24h 거래량"]:
+            html += f'<th>{header}</th>'
+        html += '</tr>'
         for i, coin in enumerate(top_coins):
-            rows.append({
-                "순위": i + 1,
-                "코인": f"{coin.get('name', '')} ({coin.get('symbol', '').upper()})",
-                "현재가": f"{coin.get('current_price', 0):,.0f}원",
-                "24h 변동": f"{coin.get('price_change_percentage_24h', 0) or 0:+.2f}%",
-                "시가총액": f"{format_krw(coin.get('market_cap', 0))}원",
-                "24h 거래량": f"{format_krw(coin.get('total_volume', 0))}원",
-            })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            change_24h = coin.get('price_change_percentage_24h', 0) or 0
+            html += (
+                f'<tr><td>{i + 1}</td>'
+                f'<td><strong>{coin.get("name", "")} ({coin.get("symbol", "").upper()})</strong></td>'
+                f'<td>{coin.get("current_price", 0):,.0f}원</td>'
+                f'<td>{colored_pnl(f"{change_24h:+.2f}%")}</td>'
+                f'<td>{format_krw(coin.get("market_cap", 0))}원</td>'
+                f'<td>{format_krw(coin.get("total_volume", 0))}원</td></tr>'
+            )
+        html += '</table>'
+        st.markdown(html, unsafe_allow_html=True)
     else:
         st.warning("코인 데이터를 불러올 수 없습니다.")
 
@@ -866,27 +1069,30 @@ with tab5:
             st.info("현재 강한 시그널을 보이는 코인이 없습니다. (관망장)")
 
         # 전체 결과 테이블
-        display_rows = []
+        html = '<table class="coin-table"><tr>'
+        for header in ["#", "코인", "현재가", "24h", "스코어", "판단", "매수 시그널", "매도 시그널", "거래대금"]:
+            html += f'<th>{header}</th>'
+        html += '</tr>'
         for i, r in enumerate(scan_results):
             action_kr = {"BUY": "매수", "SELL": "매도", "HOLD": "관망"}.get(r["판단"], "관망")
-            display_rows.append({
-                "순위": i + 1,
-                "코인": r["코인"],
-                "현재가": f"{r['현재가']:,.0f}원",
-                "24h": f"{r['24h변동']:+.1f}%",
-                "스코어": f"{r['스코어']:+d}",
-                "판단": action_kr,
-                "매수 시그널": r["매수시그널"],
-                "매도 시그널": r["매도시그널"],
-                "거래대금": f"{format_krw(r['거래대금'])}원",
-            })
-
-        st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+            html += (
+                f'<tr><td>{i + 1}</td>'
+                f'<td><strong>{r["코인"]}</strong></td>'
+                f'<td>{r["현재가"]:,.0f}원</td>'
+                f'<td>{colored_pnl(f"{r["24h변동"]:+.1f}%")}</td>'
+                f'<td>{colored_pnl(f"{r["스코어"]:+d}")}</td>'
+                f'<td>{type_badge(action_kr)}</td>'
+                f'<td style="font-size:0.85em">{r["매수시그널"]}</td>'
+                f'<td style="font-size:0.85em">{r["매도시그널"]}</td>'
+                f'<td>{format_krw(r["거래대금"])}원</td></tr>'
+            )
+        html += '</table>'
+        st.markdown(html, unsafe_allow_html=True)
 
         st.divider()
         st.caption(
             "스코어 = 각 지표(RSI, MACD, 볼린저밴드, 이동평균, 거래량, ADX, StochRSI, "
-            "OBV, 일목균형표, 변동성돌파)의 매수(+1)/매도(-1) 합산. "
+            "OBV, 일목균형표, 변동성돌파, VWAP, RSI다이버전스)의 매수(+1)/매도(-1) 합산. "
             "높을수록 매수 시그널이 강합니다."
         )
     else:

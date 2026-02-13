@@ -1,5 +1,9 @@
-import requests
+import logging
+
 import pyupbit
+import requests
+
+logger = logging.getLogger(__name__)
 
 
 def get_fear_greed_index():
@@ -11,6 +15,7 @@ def get_fear_greed_index():
         response.raise_for_status()
         return response.json().get("data", [])
     except Exception:
+        logger.warning("fear greed fetch failed", exc_info=True)
         return []
 
 
@@ -30,6 +35,7 @@ def get_market_overview():
             "market_cap_change_24h": data.get("market_cap_change_percentage_24h_usd", 0),
         }
     except Exception:
+        logger.warning("market overview fetch failed", exc_info=True)
         return {}
 
 
@@ -49,6 +55,7 @@ def get_top_coins(limit=10):
         response.raise_for_status()
         return response.json()
     except Exception:
+        logger.warning("top coins fetch failed", exc_info=True)
         return []
 
 
@@ -62,6 +69,7 @@ def get_binance_price(symbol="BTCUSDT"):
         response.raise_for_status()
         return float(response.json()["price"])
     except Exception:
+        logger.warning("binance price fetch failed", exc_info=True)
         return None
 
 
@@ -81,6 +89,7 @@ def get_usd_krw_rate():
         response.raise_for_status()
         return response.json()["rates"].get("KRW", 1350)
     except Exception:
+        logger.warning("usd/krw fetch failed", exc_info=True)
         return 1350  # 기본값
 
 
@@ -106,6 +115,7 @@ def get_kimchi_premium(upbit_ticker="KRW-BTC", binance_symbol="BTCUSDT"):
             "usd_krw": usd_krw,
         }
     except Exception:
+        logger.warning("kimchi premium fetch failed", exc_info=True)
         return None
 
 
@@ -164,4 +174,5 @@ def get_orderbook_analysis(ticker="KRW-BTC"):
             "spread_pct": round((units[0]["ask_price"] - units[0]["bid_price"]) / units[0]["ask_price"] * 100, 4) if units else 0,
         }
     except Exception:
+        logger.warning("orderbook fetch failed", exc_info=True)
         return None

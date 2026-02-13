@@ -161,6 +161,52 @@ class TradingStrategy:
         target_price = df["open"] + prev_range * k
         return target_price
 
+    def calculate_vwap(self, df):
+        """VWAP (Volume Weighted Average Price) - 기관 투자자 핵심 지표
+        거래량이 많은 가격대에 가중치를 두어 평균가를 산출
+        """
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3
+        cumulative_tp_vol = (typical_price * df["volume"]).cumsum()
+        cumulative_vol = df["volume"].cumsum()
+        vwap = cumulative_tp_vol / cumulative_vol
+        return vwap
+
+    def detect_rsi_divergence(self, df, lookback=14):
+        """RSI 다이버전스 감지
+        상승 다이버전스: 가격 저점 하락 + RSI 저점 상승 → 매수
+        하락 다이버전스: 가격 고점 상승 + RSI 고점 하락 → 매도
+        """
+        if len(df) < lookback * 2:
+            return "none"
+        close = df["close"]
+        rsi = df["rsi"]
+
+        recent_close = close.iloc[-lookback:]
+        prev_close = close.iloc[-lookback * 2:-lookback]
+        recent_rsi = rsi.iloc[-lookback:]
+        prev_rsi = rsi.iloc[-lookback * 2:-lookback]
+
+        if recent_rsi.isna().all() or prev_rsi.isna().all():
+            return "none"
+
+        recent_low = recent_close.min()
+        prev_low = prev_close.min()
+        recent_rsi_low = recent_rsi.min()
+        prev_rsi_low = prev_rsi.min()
+
+        recent_high = recent_close.max()
+        prev_high = prev_close.max()
+        recent_rsi_high = recent_rsi.max()
+        prev_rsi_high = prev_rsi.max()
+
+        # 상승 다이버전스: 가격은 더 낮은 저점, RSI는 더 높은 저점
+        if recent_low < prev_low and recent_rsi_low > prev_rsi_low:
+            return "bullish"
+        # 하락 다이버전스: 가격은 더 높은 고점, RSI는 더 낮은 고점
+        if recent_high > prev_high and recent_rsi_high < prev_rsi_high:
+            return "bearish"
+        return "none"
+
     # ================================================================
     #  지표 통합
     # ================================================================
@@ -184,6 +230,7 @@ class TradingStrategy:
         df["obv_ma"] = df["obv"].rolling(window=20).mean()
         df["ichimoku_tenkan"], df["ichimoku_kijun"], df["ichimoku_senkou_a"], df["ichimoku_senkou_b"], df["ichimoku_chikou"] = self.calculate_ichimoku(df)
         df["vb_target"] = self.calculate_volatility_breakout(df)
+        df["vwap"] = self.calculate_vwap(df)
 
         return df
 
@@ -191,10 +238,31 @@ class TradingStrategy:
     #  손절 / 익절
     # ================================================================
 
-    def check_stop_loss_take_profit(self, current_price, avg_buy_price):
+    def check_stop_loss_take_profit(self, current_price, avg_buy_price,
+                                     peak_price=None, trailing_stop_pct=2.0):
+        """손절/익절/트레일링 스탑 체크
+
+        Args:
+            current_price: 현재가
+            avg_buy_price: 매수평균가
+            peak_price: 보유 중 최고가 (트레일링 스탑용)
+            trailing_stop_pct: 최고점 대비 하락 허용 % (기본 2%)
+
+        Returns:
+            "STOP_LOSS" | "TAKE_PROFIT" | "TRAILING_STOP" | None
+        """
         if avg_buy_price <= 0 or current_price <= 0:
             return None
         pnl_pct = (current_price - avg_buy_price) / avg_buy_price * 100
+
+        # 트레일링 스탑: 수익 구간에서 고점 대비 하락 시 매도
+        if peak_price and peak_price > avg_buy_price:
+            peak_pnl = (peak_price - avg_buy_price) / avg_buy_price * 100
+            drop_from_peak = (peak_price - current_price) / peak_price * 100
+            # 수익률 2% 이상 달성 후, 고점 대비 trailing_stop_pct 이상 하락하면 매도
+            if peak_pnl >= 2.0 and drop_from_peak >= trailing_stop_pct:
+                return "TRAILING_STOP"
+
         if pnl_pct <= -self.stop_loss_pct:
             return "STOP_LOSS"
         if pnl_pct >= self.take_profit_pct:
@@ -339,14 +407,40 @@ class TradingStrategy:
             else:
                 signals["일목균형표"] = ("중립", "구름 내부 (관망)")
 
-        # ── 10. 변동성 돌파 (NEW) ──
-        if pd.notna(latest.get("vb_target")):
+        # ── 10. 변동성 돌파 ──
+        if pd.notna(latest.get("vb_target")) and pd.notna(prev.get("vb_target")):
             if latest["close"] > latest["vb_target"]:
                 signals["변동성돌파"] = ("매수", f"목표가 {latest['vb_target']:,.0f} 돌파")
                 score += 1
+            elif prev["close"] > prev["vb_target"] and latest["close"] < latest["vb_target"]:
+                signals["변동성돌파"] = ("매도", f"목표가 {latest['vb_target']:,.0f} 하향 이탈")
+                score -= 1
             else:
                 gap = (latest["vb_target"] - latest["close"]) / latest["close"] * 100
                 signals["변동성돌파"] = ("중립", f"목표가까지 {gap:.1f}%")
+
+        # ── 15. VWAP ──
+        if pd.notna(latest.get("vwap")):
+            vwap_diff_pct = (latest["close"] - latest["vwap"]) / latest["vwap"] * 100
+            if latest["close"] < latest["vwap"] and vwap_diff_pct < -1.0:
+                signals["VWAP"] = ("매수", f"VWAP 하회 ({vwap_diff_pct:+.1f}%)")
+                score += 1
+            elif latest["close"] > latest["vwap"] and vwap_diff_pct > 1.0:
+                signals["VWAP"] = ("매도", f"VWAP 상회 ({vwap_diff_pct:+.1f}%)")
+                score -= 1
+            else:
+                signals["VWAP"] = ("중립", f"VWAP 근접 ({vwap_diff_pct:+.1f}%)")
+
+        # ── 16. RSI 다이버전스 ──
+        rsi_div = self.detect_rsi_divergence(df)
+        if rsi_div == "bullish":
+            signals["RSI다이버전스"] = ("매수", "가격↓ RSI↑ (반등 가능)")
+            score += 1
+        elif rsi_div == "bearish":
+            signals["RSI다이버전스"] = ("매도", "가격↑ RSI↓ (하락 가능)")
+            score -= 1
+        else:
+            signals["RSI다이버전스"] = ("중립", "다이버전스 없음")
 
         # ── 11. 공포탐욕지수 ──
         if self.fear_greed_value is not None:
@@ -416,11 +510,11 @@ class TradingStrategy:
         # ── 종합 판단 ──
         adx_val = latest.get("adx", 0) if pd.notna(latest.get("adx")) else 0
         if adx_val < self.adx_threshold:
-            buy_threshold = 4   # 횡보장: 더 엄격
-            sell_threshold = -4
-        else:
-            buy_threshold = 3   # 추세장: 다소 유연
+            buy_threshold = 3   # 횡보장: 시그널 3개 이상
             sell_threshold = -3
+        else:
+            buy_threshold = 2   # 추세장: 시그널 2개 이상
+            sell_threshold = -2
 
         if score >= buy_threshold:
             action = "BUY"
@@ -455,6 +549,7 @@ class TradingStrategy:
                 "ichimoku_tenkan": latest.get("ichimoku_tenkan"),
                 "ichimoku_kijun": latest.get("ichimoku_kijun"),
                 "vb_target": latest.get("vb_target"),
+                "vwap": latest.get("vwap"),
                 "close": latest["close"],
             },
         }
