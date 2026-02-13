@@ -52,6 +52,8 @@ if "connected" not in st.session_state:
     st.session_state.connected = False
 if "auto_trading" not in st.session_state:
     st.session_state.auto_trading = False
+if "chart_favorites" not in st.session_state:
+    st.session_state.chart_favorites = ["KRW-BTC", "KRW-ETH"]
 
 # ================================================================
 #  캐시 함수
@@ -179,6 +181,170 @@ def type_badge(trade_type):
     }
     css = badge_map.get(trade_type, "badge-hold")
     return f'<span class="badge {css}">{trade_type}</span>'
+
+
+def load_trade_log_data():
+    """세션 또는 파일에서 거래 로그를 로드."""
+    if st.session_state.trader:
+        return st.session_state.trader.get_trade_log() or []
+
+    log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_history.json")
+    if not os.path.exists(log_file):
+        return []
+    try:
+        with open(log_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def calculate_trade_performance(trade_log):
+    """
+    거래 로그 기반 실현 손익 계산(FIFO).
+    - 매수: 원금(금액)과 수량(금액/가격) 누적
+    - 매도/손절/익절/트레일링: FIFO로 원가 매칭 후 실현손익 계산
+    """
+    empty_df = pd.DataFrame()
+    result = {
+        "has_realized": False,
+        "total_pnl": 0.0,
+        "total_cost": 0.0,
+        "total_proceeds": 0.0,
+        "total_return_pct": 0.0,
+        "today_pnl": 0.0,
+        "month_pnl": 0.0,
+        "daily": empty_df,
+        "monthly": empty_df,
+    }
+    if not trade_log:
+        return result
+
+    sell_types = {"매도", "손절", "익절", "트레일링"}
+    positions = {}  # {ticker: [{"qty": float, "cost": float}, ...]}
+    realized_rows = []
+    eps = 1e-12
+
+    rows = []
+    for t in trade_log:
+        ts = pd.to_datetime(t.get("time"), errors="coerce")
+        if pd.isna(ts):
+            continue
+        rows.append({
+            "time": ts,
+            "type": t.get("type"),
+            "ticker": t.get("ticker", ""),
+            "amount": float(t.get("amount", 0) or 0),
+            "price": float(t.get("price", 0) or 0),
+        })
+    if not rows:
+        return result
+
+    df_log = pd.DataFrame(rows).sort_values("time")
+    for row in df_log.itertuples(index=False):
+        trade_type = row.type
+        amount = row.amount
+        price = row.price
+        ticker = row.ticker
+        if amount <= 0 or price <= 0:
+            continue
+
+        qty = amount / price
+        if qty <= eps:
+            continue
+
+        lots = positions.setdefault(ticker, [])
+        if trade_type == "매수":
+            lots.append({"qty": qty, "cost": amount})
+            continue
+
+        if trade_type not in sell_types:
+            continue
+
+        original_qty = qty
+        matched_qty = 0.0
+        matched_cost = 0.0
+
+        while qty > eps and lots:
+            lot = lots[0]
+            lot_qty = lot["qty"]
+            if lot_qty <= eps:
+                lots.pop(0)
+                continue
+
+            take_qty = min(qty, lot_qty)
+            unit_cost = (lot["cost"] / lot_qty) if lot_qty > eps else 0.0
+            take_cost = unit_cost * take_qty
+
+            lot["qty"] -= take_qty
+            lot["cost"] -= take_cost
+            qty -= take_qty
+            matched_qty += take_qty
+            matched_cost += take_cost
+
+            if lot["qty"] <= eps:
+                lots.pop(0)
+
+        if matched_qty <= eps:
+            continue
+
+        matched_ratio = matched_qty / original_qty
+        proceeds = amount * matched_ratio
+        pnl = proceeds - matched_cost
+        realized_rows.append({
+            "date": row.time.strftime("%Y-%m-%d"),
+            "month": row.time.strftime("%Y-%m"),
+            "pnl": pnl,
+            "cost": matched_cost,
+            "proceeds": proceeds,
+            "trades": 1,
+        })
+
+    if not realized_rows:
+        return result
+
+    df_realized = pd.DataFrame(realized_rows)
+    total_pnl = float(df_realized["pnl"].sum())
+    total_cost = float(df_realized["cost"].sum())
+    total_proceeds = float(df_realized["proceeds"].sum())
+    total_return_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0.0
+
+    daily = (
+        df_realized.groupby("date", as_index=False)
+        .agg({"pnl": "sum", "cost": "sum", "proceeds": "sum", "trades": "sum"})
+        .sort_values("date", ascending=False)
+    )
+    daily["return_pct"] = daily.apply(
+        lambda r: (r["pnl"] / r["cost"] * 100) if r["cost"] > 0 else 0.0,
+        axis=1,
+    )
+
+    monthly = (
+        df_realized.groupby("month", as_index=False)
+        .agg({"pnl": "sum", "cost": "sum", "proceeds": "sum", "trades": "sum"})
+        .sort_values("month", ascending=False)
+    )
+    monthly["return_pct"] = monthly.apply(
+        lambda r: (r["pnl"] / r["cost"] * 100) if r["cost"] > 0 else 0.0,
+        axis=1,
+    )
+
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    month_key = datetime.now().strftime("%Y-%m")
+    today_pnl = float(daily.loc[daily["date"] == today_key, "pnl"].sum())
+    month_pnl = float(monthly.loc[monthly["month"] == month_key, "pnl"].sum())
+
+    result.update({
+        "has_realized": True,
+        "total_pnl": total_pnl,
+        "total_cost": total_cost,
+        "total_proceeds": total_proceeds,
+        "total_return_pct": total_return_pct,
+        "today_pnl": today_pnl,
+        "month_pnl": month_pnl,
+        "daily": daily,
+        "monthly": monthly,
+    })
+    return result
 
 
 def create_chart(df, strategy):
@@ -524,45 +690,108 @@ with tab1:
         balances = trader.get_balances()
 
         total_coin_value = 0.0
+        total_buy_amount = 0.0
         coin_holdings = []
+        unresolved_price_count = 0
+        holding_rows = []
+        ticker_keys = []
 
         for b in balances:
             if b["currency"] == "KRW":
                 continue
-            ticker_key = f"KRW-{b['currency']}"
             total_amt = float(b.get("balance", 0)) + float(b.get("locked", 0))
             if total_amt <= 0:
                 continue
-            try:
-                cur_price = pyupbit.get_current_price(ticker_key)
-                if cur_price is None:
-                    continue
-            except Exception:
-                continue
+            avg_price = float(b.get("avg_buy_price", 0) or 0)
+            ticker_key = f"KRW-{b['currency']}"
+            holding_rows.append({
+                "coin": b["currency"],
+                "ticker": ticker_key,
+                "amount": total_amt,
+                "avg_price": avg_price,
+            })
+            ticker_keys.append(ticker_key)
 
-            avg_price = float(b.get("avg_buy_price", 0))
-            eval_amt = total_amt * cur_price
-            buy_amt = total_amt * avg_price
-            profit = eval_amt - buy_amt
-            profit_pct = (profit / buy_amt * 100) if buy_amt > 0 else 0
-            total_coin_value += eval_amt
+        price_map = {}
+        if ticker_keys:
+            try:
+                batch_prices = pyupbit.get_current_price(ticker_keys)
+                if isinstance(batch_prices, dict):
+                    for tk, pv in batch_prices.items():
+                        if pv is not None:
+                            price_map[tk] = float(pv)
+                elif len(ticker_keys) == 1 and isinstance(batch_prices, (int, float)):
+                    price_map[ticker_keys[0]] = float(batch_prices)
+            except Exception:
+                price_map = {}
+
+        for row in holding_rows:
+            total_amt = row["amount"]
+            avg_price = row["avg_price"]
+            ticker_key = row["ticker"]
+            cur_price = price_map.get(ticker_key)
+            if cur_price is None:
+                try:
+                    single_price = pyupbit.get_current_price(ticker_key)
+                    if single_price is not None:
+                        cur_price = float(single_price)
+                except Exception:
+                    cur_price = None
+
+            buy_amt = total_amt * avg_price if avg_price > 0 else 0.0
+            if cur_price is not None and cur_price > 0:
+                eval_amt = total_amt * cur_price
+                profit = eval_amt - buy_amt if buy_amt > 0 else 0.0
+                profit_pct = (profit / buy_amt * 100) if buy_amt > 0 else 0.0
+                total_coin_value += eval_amt
+                total_buy_amount += buy_amt
+                cur_price_text = f"{cur_price:,.0f}원"
+                eval_amt_text = f"{eval_amt:,.0f}원"
+                profit_pct_text = f"{profit_pct:+.2f}%"
+                profit_text = f"{profit:+,.0f}원"
+                sort_value = eval_amt
+            else:
+                unresolved_price_count += 1
+                cur_price_text = "조회 실패"
+                eval_amt_text = "-"
+                profit_pct_text = "-"
+                profit_text = "-"
+                sort_value = buy_amt
 
             coin_holdings.append({
-                "코인": b["currency"],
+                "코인": row["coin"],
                 "보유량": round(total_amt, 8),
-                "매수평균가": f"{avg_price:,.0f}",
-                "현재가": f"{cur_price:,.0f}",
-                "평가금액": f"{eval_amt:,.0f}원",
-                "수익률": f"{profit_pct:+.2f}%",
-                "수익금": f"{profit:+,.0f}원",
+                "매수평균가": f"{avg_price:,.0f}원" if avg_price > 0 else "-",
+                "현재가": cur_price_text,
+                "평가금액": eval_amt_text,
+                "수익률": profit_pct_text,
+                "수익금": profit_text,
+                "_sort_value": sort_value,
+                "_amount": total_amt,
+                "_avg_price": avg_price,
+                "_current_price": cur_price if cur_price is not None else 0.0,
+                "_eval_amt": eval_amt if cur_price is not None else 0.0,
+                "_profit_pct": profit_pct if cur_price is not None and buy_amt > 0 else 0.0,
+                "_profit": profit if cur_price is not None and buy_amt > 0 else 0.0,
+                "_price_missing": cur_price is None,
             })
 
-        total_assets = krw_balance + total_coin_value
+        coin_holdings.sort(key=lambda x: x["_sort_value"], reverse=True)
 
-        mc1, mc2, mc3 = st.columns(3)
+        total_assets = krw_balance + total_coin_value
+        unrealized_profit = total_coin_value - total_buy_amount
+        unrealized_return = (unrealized_profit / total_buy_amount * 100) if total_buy_amount > 0 else 0.0
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
         mc1.metric("KRW 잔고", f"{krw_balance:,.0f}원")
         mc2.metric("코인 평가액", f"{total_coin_value:,.0f}원")
         mc3.metric("총 자산", f"{total_assets:,.0f}원")
+        mc4.metric("미실현 손익", f"{unrealized_profit:+,.0f}원", f"{unrealized_return:+.2f}%")
+        if unresolved_price_count > 0:
+            st.caption(
+                f"현재가 조회 실패 코인 {unresolved_price_count}개는 보유 목록에는 표시되지만 "
+                "평가금액/손익 계산에서는 제외됩니다."
+            )
 
         # 운용자금 한도 표시
         if trader.max_total_budget > 0:
@@ -722,7 +951,11 @@ with tab1:
                 held = trader.get_held_coins()
                 if held:
                     st.markdown("**보유 코인**")
-                    html = '<table class="coin-table"><tr>'
+                    html = (
+                        '<div style="max-height:420px;overflow-y:auto;border:1px solid rgba(255,255,255,0.12);'
+                        'border-radius:8px;padding:4px 0">'
+                        '<table class="coin-table"><tr>'
+                    )
                     for header in ["코인", "수익률", "평가금액", "스코어", "상태"]:
                         html += f'<th>{header}</th>'
                     html += '</tr>'
@@ -736,15 +969,15 @@ with tab1:
                             eval_amt = 0
                         status_info = multi_status.get(t, {})
                         score = status_info.get("score", "-")
-                        score_colored = colored_pnl(f"{score:+d}") if isinstance(score, int) else str(score)
+                        score_html = colored_pnl(f"{score:+d}") if isinstance(score, int) else str(score)
                         html += (
                             f'<tr><td><strong>{t.replace("KRW-", "")}</strong></td>'
                             f'<td>{colored_pnl(f"{pnl:+.2f}%")}</td>'
                             f'<td>{eval_amt:,.0f}원</td>'
-                            f'<td>{score_colored}</td>'
+                            f'<td>{score_html}</td>'
                             f'<td>{status_info.get("reason", "-")}</td></tr>'
                         )
-                    html += '</table>'
+                    html += '</table></div>'
                     st.markdown(html, unsafe_allow_html=True)
 
                 # 전체 스캔 결과 테이블
@@ -811,10 +1044,69 @@ with tab1:
 #  탭 2 : 차트 분석
 # ──────────────────────────────────────────────
 with tab2:
-    st.subheader(f"{ticker_names.get(selected_ticker, selected_ticker)} {selected_interval_name} 차트")
+    chart_tickers = cached_get_tickers()
+    chart_ticker_names = {t: t.replace("KRW-", "") for t in chart_tickers}
+    chart_default = selected_ticker if selected_ticker in chart_tickers else "KRW-BTC"
+    if chart_default not in chart_tickers and chart_tickers:
+        chart_default = chart_tickers[0]
+
+    chart_ctrl1, chart_ctrl2, chart_ctrl3 = st.columns([2, 3, 3])
+    with chart_ctrl1:
+        chart_coin_search = st.text_input(
+            "차트 코인 검색",
+            placeholder="BTC, ETH, XRP...",
+            key="chart_coin_search",
+        )
+    with chart_ctrl2:
+        if chart_coin_search:
+            chart_filtered = [t for t in chart_tickers if chart_coin_search.upper() in t.upper()]
+        else:
+            chart_filtered = chart_tickers
+        if not chart_filtered:
+            chart_filtered = chart_tickers
+
+        chart_idx = chart_filtered.index(chart_default) if chart_default in chart_filtered else 0
+        chart_selected_ticker = st.selectbox(
+            "차트 코인 선택",
+            chart_filtered,
+            index=chart_idx,
+            format_func=lambda x: chart_ticker_names.get(x, x),
+            key="chart_selected_ticker",
+        )
+    with chart_ctrl3:
+        fav_col1, fav_col2 = st.columns(2)
+        with fav_col1:
+            if st.button("즐겨찾기 추가", use_container_width=True, key="chart_fav_add"):
+                if chart_selected_ticker not in st.session_state.chart_favorites:
+                    st.session_state.chart_favorites.append(chart_selected_ticker)
+                st.rerun()
+        with fav_col2:
+            if st.button("즐겨찾기 제거", use_container_width=True, key="chart_fav_remove"):
+                st.session_state.chart_favorites = [
+                    t for t in st.session_state.chart_favorites if t != chart_selected_ticker
+                ]
+                st.rerun()
+
+    valid_favorites = [t for t in st.session_state.chart_favorites if t in chart_tickers]
+    if valid_favorites:
+        fav_default_idx = (
+            valid_favorites.index(chart_selected_ticker)
+            if chart_selected_ticker in valid_favorites else 0
+        )
+        fav_ticker = st.selectbox(
+            "즐겨찾기 바로가기",
+            valid_favorites,
+            index=fav_default_idx,
+            format_func=lambda x: chart_ticker_names.get(x, x),
+            key="chart_favorite_quick_pick",
+        )
+        if fav_ticker != chart_selected_ticker:
+            chart_selected_ticker = fav_ticker
+
+    st.subheader(f"{chart_ticker_names.get(chart_selected_ticker, chart_selected_ticker)} {selected_interval_name} 차트")
 
     chart_strategy = TradingStrategy(**strategy_params)
-    df_chart = cached_get_ohlcv(selected_ticker, selected_interval)
+    df_chart = cached_get_ohlcv(chart_selected_ticker, selected_interval)
 
     if df_chart is not None and len(df_chart) > 0:
         fig = create_chart(df_chart, chart_strategy)
@@ -838,19 +1130,40 @@ with tab2:
 with tab3:
     st.subheader("거래 내역")
 
-    trade_log = []
-    if st.session_state.trader:
-        trade_log = st.session_state.trader.get_trade_log()
-    else:
-        log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trade_history.json")
-        if os.path.exists(log_file):
-            try:
-                with open(log_file, "r", encoding="utf-8") as f:
-                    trade_log = json.load(f)
-            except Exception:
-                pass
+    trade_log = load_trade_log_data()
 
     if trade_log:
+        perf = calculate_trade_performance(trade_log)
+        st.markdown("#### 자동매매 수익 요약 (실현 기준)")
+        if perf["has_realized"]:
+            pf1, pf2, pf3, pf4 = st.columns(4)
+            pf1.metric("누적 실현손익", f'{perf["total_pnl"]:+,.0f}원', f'{perf["total_return_pct"]:+.2f}%')
+            pf2.metric("누적 실현수익률", f'{perf["total_return_pct"]:+.2f}%')
+            pf3.metric("오늘 실현손익", f'{perf["today_pnl"]:+,.0f}원')
+            pf4.metric("이번달 실현손익", f'{perf["month_pnl"]:+,.0f}원')
+            st.caption("수익률은 매도/손절/익절/트레일링 체결 건을 FIFO 원가 기준으로 계산합니다.")
+
+            day_col, month_col = st.columns(2)
+            with day_col:
+                st.markdown("##### 일별 실현 성과")
+                daily_view = perf["daily"].rename(columns={
+                    "date": "일자", "trades": "청산건수",
+                    "pnl": "실현손익(원)", "return_pct": "수익률(%)",
+                    "cost": "원가(원)", "proceeds": "매도금액(원)",
+                })
+                st.dataframe(daily_view, use_container_width=True, hide_index=True)
+            with month_col:
+                st.markdown("##### 월별 실현 성과")
+                monthly_view = perf["monthly"].rename(columns={
+                    "month": "월", "trades": "청산건수",
+                    "pnl": "실현손익(원)", "return_pct": "수익률(%)",
+                    "cost": "원가(원)", "proceeds": "매도금액(원)",
+                })
+                st.dataframe(monthly_view, use_container_width=True, hide_index=True)
+        else:
+            st.info("아직 실현 손익을 계산할 매도 내역이 없습니다. (매수만 있는 상태)")
+
+        st.divider()
         filter_options = ["전체", "매수", "매도", "손절", "익절", "트레일링", "매수실패", "매도실패", "ERROR"]
         filter_type = st.selectbox("유형 필터", filter_options)
 
@@ -1050,6 +1363,14 @@ with tab4:
 with tab5:
     st.subheader("코인 스캐너 - 유망 코인 자동 탐색")
     st.caption("주요 25개 코인의 기술적 지표를 분석하여 매수/매도 시그널 점수로 순위를 매깁니다.")
+    scanner_perf = calculate_trade_performance(load_trade_log_data())
+    if scanner_perf["has_realized"]:
+        sf1, sf2, sf3 = st.columns(3)
+        sf1.metric("누적 실현손익", f'{scanner_perf["total_pnl"]:+,.0f}원', f'{scanner_perf["total_return_pct"]:+.2f}%')
+        sf2.metric("누적 실현수익률", f'{scanner_perf["total_return_pct"]:+.2f}%')
+        sf3.metric("이번달 실현손익", f'{scanner_perf["month_pnl"]:+,.0f}원')
+    else:
+        st.caption("실현 손익 통계는 매도 체결이 누적되면 자동 표시됩니다.")
 
     if st.button("스캔 시작", type="primary", key="scan_btn"):
         st.cache_data.clear()
@@ -1075,12 +1396,14 @@ with tab5:
         html += '</tr>'
         for i, r in enumerate(scan_results):
             action_kr = {"BUY": "매수", "SELL": "매도", "HOLD": "관망"}.get(r["판단"], "관망")
+            change_html = colored_pnl(f"{r['24h변동']:+.1f}%")
+            score_html = colored_pnl(f"{r['스코어']:+d}")
             html += (
                 f'<tr><td>{i + 1}</td>'
                 f'<td><strong>{r["코인"]}</strong></td>'
                 f'<td>{r["현재가"]:,.0f}원</td>'
-                f'<td>{colored_pnl(f"{r["24h변동"]:+.1f}%")}</td>'
-                f'<td>{colored_pnl(f"{r["스코어"]:+d}")}</td>'
+                f'<td>{change_html}</td>'
+                f'<td>{score_html}</td>'
                 f'<td>{type_badge(action_kr)}</td>'
                 f'<td style="font-size:0.85em">{r["매수시그널"]}</td>'
                 f'<td style="font-size:0.85em">{r["매도시그널"]}</td>'
