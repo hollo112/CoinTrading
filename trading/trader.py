@@ -10,7 +10,7 @@ import pyupbit
 from trading.strategy import TradingStrategy
 from trading.data_collector import (
     get_fear_greed_index, get_kimchi_premium,
-    get_orderbook_analysis,
+    get_orderbook_analysis, get_hot_coins,
 )
 
 TRADE_LOG_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "trade_history.json")
@@ -52,6 +52,9 @@ class AutoTrader:
         self.peak_prices = {}   # {ticker: 보유 중 최고가} — 트레일링 스탑용
         self.trailing_stop_pct = 2.0  # 최고점 대비 하락 허용 %
         self.max_total_budget = 0     # 총 운용자금 한도 (0 = 제한 없음)
+        self.hot_coins_enabled = False
+        self.hot_coins = []           # 탐지된 핫코인 리스트
+        self._last_hot_scan = None    # 마지막 핫코인 스캔 날짜
         self._lock = threading.Lock()
         self._load_trade_log()
 
@@ -507,8 +510,45 @@ class AutoTrader:
 
     # ── 멀티코인 자동매매 ──
 
+    def _refresh_hot_coins(self):
+        """핫코인 리스트 갱신 (하루 1회)"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self._last_hot_scan == today:
+            return
+        try:
+            self.hot_coins = get_hot_coins(self.COIN_LIST)
+            self._last_hot_scan = today
+            if self.hot_coins:
+                logger.info("핫코인 탐지: %s", self.hot_coins)
+        except Exception:
+            logger.warning("핫코인 탐지 실패", exc_info=True)
+            self.hot_coins = []
+
+    def _build_scan_list(self):
+        """스캔 대상 코인 리스트 구성: COIN_LIST + 핫코인 + 보유 코인"""
+        try:
+            available = pyupbit.get_tickers(fiat="KRW")
+        except Exception:
+            available = []
+
+        base = [t for t in self.COIN_LIST if t in available]
+
+        if self.hot_coins_enabled:
+            self._refresh_hot_coins()
+            for t in self.hot_coins:
+                if t not in base and t in available:
+                    base.append(t)
+
+        # 보유 코인 보호: 핫코인이 다음날 빠져도 보유 중이면 계속 관리
+        held = self.get_held_coins()
+        for t in held:
+            if t not in base and t in available:
+                base.append(t)
+
+        return base
+
     def start_multi(self, interval, check_interval, invest_ratio, max_invest_amount,
-                    max_coins, strategy_params, max_total_budget=0):
+                    max_coins, strategy_params, max_total_budget=0, hot_coins_enabled=False):
         """멀티코인 모드로 자동매매 시작"""
         self.multi_mode = True
         self.interval = interval
@@ -520,13 +560,11 @@ class AutoTrader:
         self.strategy_params = strategy_params or {}
         self.strategy = TradingStrategy(**self.strategy_params)
         self.multi_status = {}
+        self.hot_coins_enabled = hot_coins_enabled
+        self.hot_coins = []
+        self._last_hot_scan = None
 
-        # 스캔 대상 코인 리스트 (실제 거래 가능한 것만)
-        try:
-            available = pyupbit.get_tickers(fiat="KRW")
-        except Exception:
-            available = []
-        self.coin_list = [t for t in self.COIN_LIST if t in available]
+        self.coin_list = self._build_scan_list()
 
         self.is_running = True
         self._update_state(status="멀티코인 실행 중")
@@ -537,6 +575,8 @@ class AutoTrader:
         """멀티코인 매매 루프"""
         while self.is_running:
             try:
+                # 매 루프마다 스캔 리스트 갱신 (핫코인 하루 1회 + 보유 코인 보호)
+                self.coin_list = self._build_scan_list()
                 with self._lock:
                     self.check_count += 1
                 self._multi_check_and_trade()

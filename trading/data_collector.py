@@ -1,4 +1,5 @@
 import logging
+import time
 
 import pyupbit
 import requests
@@ -57,6 +58,80 @@ def get_top_coins(limit=10):
     except Exception:
         logger.warning("top coins fetch failed", exc_info=True)
         return []
+
+
+# ── 핫코인 탐지 ──
+
+def get_hot_coins(existing_coins, min_volume_krw=5_000_000_000, surge_ratio=2.0, max_count=10):
+    """거래대금 급등 코인 자동 탐지 (잡코인 필터링 포함).
+
+    Parameters
+    ----------
+    existing_coins : list[str]
+        이미 스캔 대상인 코인 리스트 (예: COIN_LIST). 중복 제외용.
+    min_volume_krw : float
+        24h 거래대금 최소 기준 (기본 50억원).
+    surge_ratio : float
+        직전 7일 평균 대비 거래대금 급등 배수 (기본 2배).
+    max_count : int
+        최대 반환 개수 (기본 10).
+
+    Returns
+    -------
+    list[str]
+        핫코인 티커 리스트 (예: ["KRW-ONDO", "KRW-HBAR", ...])
+    """
+    try:
+        all_tickers = pyupbit.get_tickers(fiat="KRW")
+    except Exception:
+        logger.warning("get_hot_coins: 전체 티커 조회 실패", exc_info=True)
+        return []
+
+    if not all_tickers:
+        return []
+
+    existing_set = set(existing_coins)
+    candidates = [t for t in all_tickers if t not in existing_set]
+
+    hot = []
+    for ticker in candidates:
+        try:
+            # 최근 8일 일봉 조회 (오늘 + 7일)
+            df = pyupbit.get_ohlcv(ticker, interval="day", count=8)
+            time.sleep(0.11)  # API 속도 제한 준수
+
+            if df is None or len(df) < 2:
+                continue
+
+            # 24h 거래대금 = 최근 1봉의 close * volume
+            today_volume_krw = float(df.iloc[-1]["close"] * df.iloc[-1]["volume"])
+
+            # 최소 거래대금 필터
+            if today_volume_krw < min_volume_krw:
+                continue
+
+            # 직전 7일 평균 거래대금 (오늘 제외)
+            past_days = df.iloc[:-1]
+            if len(past_days) == 0:
+                continue
+            avg_volume_krw = float(
+                (past_days["close"] * past_days["volume"]).mean()
+            )
+
+            if avg_volume_krw <= 0:
+                continue
+
+            ratio = today_volume_krw / avg_volume_krw
+            if ratio >= surge_ratio:
+                hot.append((ticker, today_volume_krw, ratio))
+
+        except Exception:
+            logger.debug("get_hot_coins: %s 처리 실패", ticker, exc_info=True)
+            continue
+
+    # 거래대금 급등 비율 순으로 정렬
+    hot.sort(key=lambda x: x[2], reverse=True)
+    return [t[0] for t in hot[:max_count]]
 
 
 # ── 김치프리미엄 (Binance 무료 API) ──

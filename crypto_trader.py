@@ -582,6 +582,14 @@ with st.sidebar:
     else:
         st.info("멀티코인 모드: 25개 주요 코인을 자동 스캔합니다.")
         max_coins = st.slider("동시 보유 최대 코인 수", 1, 10, 5, key="max_coins")
+        hot_coins_enabled = st.checkbox(
+            "핫코인 자동 탐지",
+            value=False,
+            key="hot_coins_enabled",
+            help="거래대금 급등 코인을 자동으로 탐지하여 스캔 대상에 추가합니다. (하루 1회 갱신)",
+        )
+        if hot_coins_enabled:
+            st.caption("24h 거래대금 50억+ & 7일 평균 대비 2배 이상 급등 코인을 탐지합니다.")
         selected_ticker = "KRW-BTC"  # 차트 표시용 기본값
 
     interval_options = {
@@ -647,6 +655,7 @@ with st.sidebar:
                         max_coins=max_coins,
                         strategy_params=strategy_params,
                         max_total_budget=max_budget,
+                        hot_coins_enabled=hot_coins_enabled,
                     )
                 else:
                     st.session_state.trader.start(
@@ -946,6 +955,13 @@ with tab1:
             multi_status = state.get("multi_status") or {}
             if state.get("multi_mode") and multi_status:
                 st.subheader("멀티코인 스캔 결과")
+
+                # 핫코인 탐지 결과 표시
+                if trader.hot_coins_enabled and trader.hot_coins:
+                    hot_names = ", ".join(t.replace("KRW-", "") for t in trader.hot_coins)
+                    st.info(f"탐지된 핫코인 ({len(trader.hot_coins)}개): {hot_names}")
+                elif trader.hot_coins_enabled:
+                    st.caption("핫코인 탐지 활성화됨 — 아직 조건에 맞는 코인이 없습니다.")
 
                 # 보유 코인 수익률
                 held = trader.get_held_coins()
